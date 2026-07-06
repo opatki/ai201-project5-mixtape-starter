@@ -46,3 +46,71 @@ The notable thing tracing this end-to-end: `rate_song()` lives in `notification_
 - **Association tables double as data, not just links.** `playlist_entries` carries `position`/`added_by`/`added_at` — ordering and attribution live in the join table, which is why `playlist_service.get_playlist_songs()` has to explicitly `.order_by(asc(playlist_entries.c.position))` rather than relying on relationship default ordering.
 - **Notifications are fire-and-forget, one-directional strings.** `create_notification()` takes a free-text `body` built by the caller (e.g. an f-string embedding `adder.username`, `song.title`, `playlist.name`) rather than storing structured references — the notification can't be traced back to "which rating/which playlist-entry caused this," only read as a rendered message.
 - **Feature coverage in `tests/` mirrors the assignment's bug list, not the full service surface** — `streak_service`, `search_service`, and `playlist_service` all have dedicated test files; `notification_service` and `feed_service` don't, despite being just as central to the app's behavior.
+
+## Bug fixes
+
+### Issue 1 — My listening streak keeps resetting
+
+**Location:** `services/streak_service.py`, `update_listening_streak()`.
+
+**Root cause:** The consecutive-day branch was gated by an extra condition that has nothing to do with streak correctness:
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+else:
+    user.listening_streak = 1
+```
+`days_since_last == 1` already means "listened yesterday, listening again today" — that's a complete, correct definition of a consecutive day. The `and today.weekday() != 6` clause additionally requires that today not be a Sunday. Whenever today *is* Sunday, the condition is false regardless of `days_since_last`, so execution falls through to `else` and the streak resets to 1 — even though the user listened yesterday too. This contradicts the function's own docstring, which states the increment rule with no day-of-week exception.
+
+**How I reproduced it:** Checked out the pre-fix version of `services/streak_service.py` from git history (`git show HEAD~1:services/streak_service.py`) and called the real `update_listening_streak(user, now)` function directly (same function `record_listening_event()` calls on every `POST /songs/<song_id>/listen`) for a single user, once per day, for 14 consecutive calendar days with zero gaps — Monday, June 10, 2024 through Sunday, June 23, 2024. Printed the resulting `user.listening_streak` after each call. Actual output:
+```
+2024-06-10 (Monday   ) -> streak = 1
+2024-06-11 (Tuesday  ) -> streak = 2
+2024-06-12 (Wednesday) -> streak = 3
+2024-06-13 (Thursday ) -> streak = 4
+2024-06-14 (Friday   ) -> streak = 5
+2024-06-15 (Saturday ) -> streak = 6
+2024-06-16 (Sunday   ) -> streak = 1   <- resets despite no gap
+2024-06-17 (Monday   ) -> streak = 2
+2024-06-18 (Tuesday  ) -> streak = 3
+2024-06-19 (Wednesday) -> streak = 4
+2024-06-20 (Thursday ) -> streak = 5
+2024-06-21 (Friday   ) -> streak = 6
+2024-06-22 (Saturday ) -> streak = 7
+2024-06-23 (Sunday   ) -> streak = 1   <- resets again, same pattern
+```
+The streak resets to 1 every single Sunday, regardless of an unbroken daily listening history — a weekly, deterministic reset. This is also the exact scenario the pre-existing (but previously failing) test `test_streak_increments_on_sunday` in `tests/test_streaks.py` was written to catch.
+
+**Fix:** Removed the `and today.weekday() != 6` clause so the increment applies uniformly on every consecutive day:
+```python
+elif days_since_last == 1:
+    user.listening_streak += 1
+```
+
+**Verification:** `pytest tests/test_streaks.py` — all 5 tests pass, including `test_streak_increments_on_sunday`, which failed (`assert 1 == 2`) before the fix.
+
+---
+
+### Issue 5 — The last song in a playlist never shows up
+
+**Location:** `services/playlist_service.py`, `get_playlist_songs()`.
+
+**Root cause:** The SQL query itself is correct — it joins `Song` through the `playlist_entries` association table, filters by `playlist_id`, and orders by the `position` column ascending, producing the full, correctly-ordered list of songs. The bug is a stray list slice applied to that already-correct result, right before serialization:
+```python
+return [song.to_dict() for song in songs[:-1]]
+```
+`songs[:-1]` drops the last element of any list. Since `songs` is already the complete, ordered result set, this unconditionally discards the final song in the playlist — not an off-by-one in the query or the `position` values, just a trailing item dropped in Python after the database already returned the right rows.
+
+**How I reproduced it:** Stashed the working-tree fix (`git stash push -- services/playlist_service.py`) to expose the pre-fix version, then created one user, five songs ("Track 1"–"Track 5"), and one playlist with all five songs inserted into `playlist_entries` at positions 1–5 — the same shape `GET /playlists/<id>/songs` → `get_playlist_songs()` reads. Called the real `get_playlist_songs(playlist.id)` function and compared what was inserted vs. what it returned. Actual output:
+```
+Inserted 5 songs: ['Track 1', 'Track 2', 'Track 3', 'Track 4', 'Track 5']
+get_playlist_songs() returned 4 songs: ['Track 1', 'Track 2', 'Track 3', 'Track 4']
+```
+"Track 5" — the song at the highest `position` — is silently missing from the response for a playlist of any size greater than zero. This matches the pre-existing (but previously failing) tests `test_playlist_returns_all_songs` (expected 5, got 4) and `test_playlist_returns_songs_in_order` (expected `Track 5` at the end, missing entirely) in `tests/test_playlists.py`.
+
+**Fix:** Removed the slice so the full ordered result set is returned:
+```python
+return [song.to_dict() for song in songs]
+```
+
+**Verification:** `pytest tests/test_playlists.py` — all 3 tests pass, including the two that failed before the fix.
