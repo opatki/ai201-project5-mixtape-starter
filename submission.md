@@ -114,3 +114,35 @@ return [song.to_dict() for song in songs]
 ```
 
 **Verification:** `pytest tests/test_playlists.py` — all 3 tests pass, including the two that failed before the fix.
+
+---
+
+### Issue 2 — Friends Listening Now shows people from yesterday
+
+**Location:** `services/feed_service.py`, `get_friends_listening_now()`.
+
+**Root cause:**
+```python
+RECENT_THRESHOLD = timedelta(hours=24)
+...
+cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD
+```
+"Listening Now" is supposed to mean genuinely current activity, but the recency window used to decide that was a full rolling 24 hours. Any friend who listened at any point in the last 24 hours passes the `ListeningEvent.listened_at >= cutoff` filter — including someone who listened 23 hours ago, which by calendar date is *yesterday* relative to today. A 24-hour rolling window and a "yesterday vs. today" calendar boundary are two different things, and the code was using the former where the feature actually needs something much closer to real-time. `seed_data.py` telegraphs the intended window directly in its own comment: recent events are seeded "within the past 30 minutes" and are meant to appear, while events that are hours old are meant to be excluded "after fix" — i.e., the constant itself (24h) was the bug, not the query logic around it.
+
+**How I reproduced it:** Fixed "now" at 2024-06-11 01:00 UTC and gave three friends one listening event each: `yesterday_friend` at 2024-06-10 02:00 UTC (23 hours earlier — a different calendar day), `current_friend` 5 minutes earlier (genuinely current), and `old_friend` 3 days earlier (unambiguously stale). Called the real `get_friends_listening_now(me.id)` (the same function `GET /feed/<user_id>/listening-now` calls), with `datetime.now` patched to the fixed timestamp so the "23 hours ago" boundary was exact and reproducible. Actual output before the fix:
+```
+'now' = 2024-06-11T01:00:00+00:00
+yesterday_friend listened at 2024-06-10T02:00:00+00:00 (23:00:00 ago, calendar date 2024-06-10)
+current_friend listened at 2024-06-11T00:55:00+00:00 (0:05:00 ago, calendar date 2024-06-11)
+old_friend listened at 2024-06-08T01:00:00+00:00 (3 days, 0:00:00 ago, calendar date 2024-06-08)
+
+get_friends_listening_now() returned 2 friend(s): ['current_friend', 'yesterday_friend']
+```
+`yesterday_friend` — whose only listen was on a different calendar date, 23 hours in the past — incorrectly appears in "Friends Listening Now" right alongside someone who listened 5 minutes ago. `old_friend` (3 days old) was correctly excluded, confirming the filter works, just with too generous a window.
+
+**Fix:** Tightened the recency window from 24 hours to 30 minutes, matching the intent already documented in `seed_data.py`'s own comments:
+```python
+RECENT_THRESHOLD = timedelta(minutes=30)
+```
+
+**Verification:** Re-ran the identical reproduction script against the fixed code — `get_friends_listening_now()` now returns only `['current_friend']`; `yesterday_friend` is correctly excluded. Also added `tests/test_feed.py` (previously missing — `feed_service.py` had no dedicated test file, unlike `streak_service`/`search_service`/`playlist_service`) with three regression tests covering the 23-hours-ago, 5-minutes-ago, and 3-days-ago cases. `pytest tests/` — all 16 tests pass (13 pre-existing + 3 new).
