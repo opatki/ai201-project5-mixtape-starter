@@ -4,6 +4,10 @@ __pycache__/
 *.pyo
 *.pyd
 *.pyc
+.claude/
+.claude
+.pytest_cache
+.pytest_cache/
 
 # Virtual environment
 .venv/
